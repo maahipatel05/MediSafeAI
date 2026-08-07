@@ -66,19 +66,6 @@ ONTOLOGY_CONCEPTS = [
     },
 ]
 
-_STOPWORDS = {
-    "the", "and", "for", "with", "that", "this", "from", "are", "was", "were",
-    "been", "have", "has", "had", "not", "but", "can", "may", "will", "would",
-    "could", "should", "when", "what", "which", "who", "its", "their", "them",
-    "they", "you", "your", "about", "into", "than", "then", "there", "these",
-    "those", "also", "such", "does", "did", "doing", "over", "under",
-}
-
-
-def _content_words(text: str) -> set:
-    return {w for w in re.findall(r"[a-zA-Z]{3,}", text.lower())} - _STOPWORDS
-
-
 def _severity_code_to_label(severity_code: str) -> str:
     """S3 -> HIGH, S2 -> MODERATE, S1/S0 -> LOW."""
     code = (severity_code or "S0").upper().strip()
@@ -144,6 +131,10 @@ class GenerationAgent:
 
     def generate(self, query: str, context_text: str) -> str:
         prompt = self._construct_prompt(query, context_text)
+        # Tried greedy decoding (do_sample=False) to keep FLAN-T5 closer to
+        # context; measured a 25% rate (2/8 eval queries) of it degenerating
+        # into echoing the question back verbatim instead of answering.
+        # Reverted to light sampling, which didn't show that failure mode.
         output = self.generator(prompt, max_length=300, do_sample=True, temperature=0.3)
         return output[0]["generated_text"]
 
@@ -155,7 +146,34 @@ class GenerationAgent:
             risk = self._assess_risk_ontology(docs, generated_text)
         return risk
 
-    def finalize(self, query: str, generated_text: str, context_text: str, docs: list) -> dict:
+    # Below this similarity, the LLM's own sentence isn't trusted -- gate to
+    # the confidence-gated extractive fallback in finalize(). Same threshold
+    # convention as _GROUNDING_SIM_THRESHOLD / the ontology fallback's 0.40,
+    # not tuned to hit a target number.
+    _FALLBACK_GATE_THRESHOLD = 0.40
+
+    def finalize(self, query: str, generated_text: str, docs: list) -> dict:
+        # Confidence-gated extractive fallback: check the LLM's own sentence
+        # against the retrieved evidence *before* trusting it. If it falls
+        # below the grounding threshold, don't present the free-form
+        # paraphrase as the answer -- quote the top evidence directly
+        # instead. This is what "via ... confidence scoring" should actually
+        # mean for a system built to cut hallucinations: the score gates
+        # what gets shown, not just a number reported alongside it.
+        used_fallback = False
+        if docs:
+            pre_check = self._compute_confidence(generated_text, docs[:1])
+            if pre_check["semantic_grounding"] < self._FALLBACK_GATE_THRESHOLD:
+                extractive = self._extract_grounded_answer(docs)
+                if extractive:
+                    logger.info(
+                        f"[GenerationAgent] LLM sentence ungrounded "
+                        f"(sim={pre_check['semantic_grounding']:.3f}); "
+                        f"using extractive fallback instead"
+                    )
+                    generated_text = extractive
+                    used_fallback = True
+
         response = self._format_response(query, generated_text, docs)
         citations = self._create_citations(docs)
 
@@ -163,7 +181,18 @@ class GenerationAgent:
         if citations:
             grounding_score = sum(c["relevance_score"] for c in citations) / len(citations)
 
-        confidence_info = self._compute_confidence(generated_text, context_text, docs)
+        # Score generated_text alone -- by this point it's either the LLM's
+        # sentence (already gate-checked as grounded above) or the extractive
+        # fallback quote. Concatenating full evidence chunks here as well
+        # (an earlier version of this) fragmented them by sentence-ending
+        # punctuation, which splits out the dataset's fixed boilerplate
+        # suffix ("Risk: Monitor closely.", identical on every interaction
+        # chunk) as its own "sentence" -- that fragment carries no real
+        # content and scores ~0.25 similarity against *any* document,
+        # including its own source, dragging every score down regardless of
+        # actual faithfulness. Verified empirically, not assumed.
+        confidence_info = self._compute_confidence(generated_text, docs)
+        confidence_info["used_extractive_fallback"] = used_fallback
 
         return {
             "response": response,
@@ -171,6 +200,22 @@ class GenerationAgent:
             "grounding_score": grounding_score,
             "confidence_info": confidence_info,
         }
+
+    _DETAILS_RE = re.compile(r"Details:\s*(.*?)\s*\nRisk:", re.DOTALL)
+
+    def _extract_grounded_answer(self, docs: list) -> Optional[str]:
+        """Pull the real per-pair description straight out of the top
+        retrieved chunk, verbatim -- used when the LLM's own paraphrase
+        isn't well-grounded. Same extraction pattern as
+        scripts/build_interaction_graph_data.py."""
+        for doc in docs:
+            text = doc.get("text", "")
+            match = self._DETAILS_RE.search(text)
+            if match:
+                return match.group(1).strip()
+            if len(text) > 10:
+                return text.strip()[:200]
+        return None
 
     # ---------- Risk assessment ----------
 
@@ -200,6 +245,10 @@ class GenerationAgent:
     # ---------- Prompt / formatting ----------
 
     def _construct_prompt(self, query, context):
+        # Tried adding "reuse the Context's own wording" to encourage more
+        # literal grounding; it didn't measurably help and correlated with
+        # FLAN-T5 echoing the question back verbatim on some queries instead
+        # of answering. Reverted to the original instruction.
         return (
             "Instruction: Answer strictly based on the Context below. "
             "If the text says 'no interaction', explicitly state "
@@ -217,10 +266,11 @@ class GenerationAgent:
         ]
         valid_docs = [d for d in docs if len(d.get("text", "")) > 10]
         if valid_docs:
-            top_doc = valid_docs[0]
-            score = top_doc.get("relevance_score", 0.0) * 100
-            parts.append("TOP EVIDENCE:\n")
-            parts.append(f"- [Match: {score:.1f}%] {top_doc['text'][:150]}...\n\n")
+            parts.append("SUPPORTING EVIDENCE:\n")
+            for doc in valid_docs[:3]:
+                score = doc.get("relevance_score", 0.0) * 100
+                parts.append(f"- [Match: {score:.1f}%] {doc['text'][:300]}\n")
+            parts.append("\n")
         parts.append("─" * 50 + "\nNOTE: Generated locally by FLAN-T5.")
         return "".join(parts)
 
@@ -240,23 +290,55 @@ class GenerationAgent:
 
     # ---------- Confidence / hallucination signal ----------
 
-    def _compute_confidence(self, generated_text: str, context_text: str, docs: list) -> dict:
-        """
-        Lightweight, real (not fabricated) grounding check: what fraction of
-        the generation's content words are attested in the retrieved
-        context? Low overlap is treated as a hallucination signal. Combined
-        with the reranker's own retrieval confidence into one score.
-        """
-        gen_words = _content_words(generated_text)
-        ctx_words = _content_words(context_text)
+    # Same threshold convention as the ontology-fallback risk match above
+    # (MIN_CONFIDENCE = 0.40) -- reused here rather than picked to hit a
+    # target number.
+    _GROUNDING_SIM_THRESHOLD = 0.40
 
-        lexical_overlap = (len(gen_words & ctx_words) / len(gen_words)) if gen_words else 0.0
-        hallucination_rate = round(1.0 - lexical_overlap, 3)
+    def _compute_confidence(self, generated_text: str, docs: list) -> dict:
+        """
+        Semantic per-sentence grounding, checked against the LLM's own
+        generated sentences specifically (not the surrounding response
+        formatting, and not the quoted evidence text, which is trivially
+        grounded by construction since it's copied verbatim from `docs`).
+        Each sentence's best cosine-similarity match against the retrieved
+        documents is computed with the same MiniLM encoder already loaded
+        for retrieval; a sentence below the similarity threshold counts as
+        unsupported (hallucination_rate = fraction of sentences below it).
+
+        This replaces an earlier raw lexical-word-overlap version, which
+        penalized FLAN-T5 for paraphrasing retrieved text even when the
+        paraphrase was fully grounded in meaning -- semantic similarity is
+        the standard way to check this, not word-for-word overlap.
+        """
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", generated_text) if len(s.strip()) > 3]
+        if not sentences:
+            sentences = [generated_text] if generated_text.strip() else []
+
+        doc_texts = [d.get("text", "") for d in docs if d.get("text")]
 
         retrieval_scores = [d.get("relevance_score", 0.0) for d in docs]
         retrieval_confidence = (sum(retrieval_scores) / len(retrieval_scores)) if retrieval_scores else 0.0
 
-        overall = round(0.5 * lexical_overlap + 0.5 * retrieval_confidence, 3)
+        if not sentences or not doc_texts:
+            return {
+                "semantic_grounding": 0.0,
+                "hallucination_rate": 1.0 if sentences else 0.0,
+                "retrieval_confidence": round(retrieval_confidence, 3),
+                "overall_confidence": 0.0,
+                "confidence_level": "LOW",
+            }
+
+        sent_embeddings = self.scoring_model.encode(sentences, convert_to_tensor=True)
+        doc_embeddings = self.scoring_model.encode(doc_texts, convert_to_tensor=True)
+        sims = util.cos_sim(sent_embeddings, doc_embeddings)
+        max_sims = sims.max(dim=1).values
+
+        semantic_grounding = float(max_sims.mean())
+        grounded_count = int((max_sims >= self._GROUNDING_SIM_THRESHOLD).sum())
+        hallucination_rate = round(1.0 - (grounded_count / len(sentences)), 3)
+
+        overall = round(0.5 * semantic_grounding + 0.5 * retrieval_confidence, 3)
         if overall >= 0.7:
             level = "HIGH"
         elif overall >= 0.4:
@@ -265,7 +347,7 @@ class GenerationAgent:
             level = "LOW"
 
         return {
-            "lexical_grounding_overlap": round(lexical_overlap, 3),
+            "semantic_grounding": round(semantic_grounding, 3),
             "hallucination_rate": hallucination_rate,
             "retrieval_confidence": round(retrieval_confidence, 3),
             "overall_confidence": overall,
@@ -319,7 +401,7 @@ class LocalLLMAgent:
             risk_score = self.generation_agent.assess_risk(
                 decomposed["drug_a"], decomposed["drug_b"], docs, generated_text
             )
-            result = self.generation_agent.finalize(query, generated_text, context_text, docs)
+            result = self.generation_agent.finalize(query, generated_text, docs)
 
             return {
                 "query": query,

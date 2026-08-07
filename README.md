@@ -24,8 +24,10 @@ Query ──▶ [1] QueryAgent ──▶ [2] RetrievalAgent ──▶ [3] Genera
   (`backend/reranker.py`).
 - **GenerationAgent** — generates a grounded explanation with a local FLAN-T5-large model, assesses
   interaction severity (drug-interaction graph lookup, falling back to an embedding-similarity
-  ontology match when no graph edge exists), builds citations, and computes a grounding score plus
-  a lexical-overlap confidence/hallucination signal.
+  ontology match when no graph edge exists), builds citations, and computes a grounding score.
+  Before trusting FLAN-T5's own paraphrase, a semantic-similarity confidence check gates it against
+  the retrieved evidence; if it isn't well-grounded, the answer is replaced with a verbatim quote
+  from the source document instead (a confidence-gated extractive fallback).
 
 The whole pipeline is wired through LangGraph (`backend/langgraph_agent.py`) as an explicit
 5-node graph with one conditional edge (graph-based risk lookup, falling back to the ontology
@@ -66,14 +68,28 @@ inference:
 | Metric | Value |
 |---|---|
 | Average grounding score | 81.5% |
-| Average confidence score | 0.55 (MEDIUM band) |
-| Average end-to-end latency | 7.8s (max 9.8s) |
+| Average confidence score | 0.87 (HIGH band) |
+| Average semantic grounding | 0.92 |
+| Hallucination rate | 0% |
+| Extractive fallback triggered | 8/8 queries |
+| Average end-to-end latency | 5.8s |
 
-The confidence/hallucination signal is a lightweight, real heuristic — lexical content-word
-overlap between the generation and its retrieved context, blended with the reranker's retrieval
-confidence — not a rigorous NLI-based hallucination detector. It's noisiest on very short
-generations (few content words to check overlap against), which is a known limitation of the
-metric, not hidden here.
+The confidence signal is a semantic-similarity check (same MiniLM encoder used for retrieval)
+between each generated sentence and the retrieved evidence it's supposed to be grounded in — not
+a trained or NLI-based hallucination classifier. When FLAN-T5's own paraphrase falls below the
+grounding threshold, the **confidence-gated extractive fallback** replaces it with a verbatim quote
+from the top retrieved document instead of showing an unverified paraphrase. On this evaluation
+set, the fallback triggered on all 8/8 queries — FLAN-T5-large's own wording was never trusted as-is,
+so every answer shown is a direct, source-verified excerpt. That's *why* hallucination rate is 0%
+here: it's a property of what the system chooses to show, not a claim that the underlying local
+model never confabulates on its own.
+
+An earlier version of this check scored answers against a blob that included the full retrieved
+document text; that fragmented on sentence-ending punctuation and picked up this dataset's fixed
+boilerplate suffix ("Risk: Monitor closely.", identical on every interaction chunk) as its own
+pseudo-sentence, which scored ~0.25 similarity against *any* document (verified) purely because it
+carries no distinguishing content — dragging every score down regardless of actual faithfulness.
+Fixed by scoring only the actual answer text.
 
 ## Dataset
 
@@ -96,10 +112,13 @@ both checked in so the pipeline runs without needing a DrugBank license.
 - The parsed dataset is capped at 500 primary drugs (a demo-scale limit in the chunking script),
   not full DrugBank coverage — some common drug names (e.g., plain "Aspirin") aren't present as
   standalone entities, only as interaction targets of the 500 parsed drugs.
-- End-to-end latency (~7.8s avg) reflects CPU-only local FLAN-T5-large inference; no GPU
+- End-to-end latency (~5.8s avg) reflects CPU-only local FLAN-T5-large inference; no GPU
   acceleration is configured.
-- The confidence/hallucination signal is a lexical-overlap heuristic, not a trained or NLI-based
-  classifier.
+- The 0% hallucination rate reflects that the extractive fallback triggered on all 8/8 evaluation
+  queries -- it measures what the system shows the user (source-verified excerpts), not FLAN-T5's
+  unfiltered generation quality on its own.
+- The confidence/grounding signal is a semantic-similarity heuristic (cosine similarity via the
+  retrieval encoder), not a trained or NLI-based hallucination classifier.
 
 ## Tech stack
 

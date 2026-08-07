@@ -84,7 +84,7 @@ def build_drug_rag_graph(agent):
     def compile_node(state: DrugQueryState) -> DrugQueryState:
         """Node 5: Agent 3 - response formatting, citations, grounding + confidence."""
         result = agent.generation_agent.finalize(
-            state["query"], state["generated_text"], state["context_text"], state["retrieved_docs"]
+            state["query"], state["generated_text"], state["retrieved_docs"]
         )
         return {
             **state,

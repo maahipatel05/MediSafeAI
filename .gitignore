@@ -1,0 +1,24 @@
+.env
+backend/.env
+frontend/.env
+*.env
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Course/planning materials and stray docs -- keep the repo focused on the
+# code and the real, verified results.
+*.pdf
+*.md
+!/README.md
+
+# Root-level npm debris from an accidental install outside frontend/
+/package.json
+/package-lock.json
+
+# Local venvs / build output
+venv/
+.venv/
+build/
+*.egg-info/

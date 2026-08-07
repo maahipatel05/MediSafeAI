@@ -1,348 +1,177 @@
-# 📝 MediSafe AI - Simple Step-by-Step Guide
+# MediSafe AI
 
-## 🎯 Goal
-Get MediSafe AI running on your computer in ~20 minutes
+A grounded, retrieval-augmented drug-interaction assistant. Every answer is backed by citations
+into a real DrugBank-derived knowledge base, and every metric in this README is produced by the
+evaluation scripts checked into this repo — not estimated.
 
----
+## Architecture
 
-## ✅ Pre-Flight Checklist
+Three agents, orchestrated as a LangGraph state machine:
 
-Before you start, download and install (if not already installed):
-
-- [ ] Node.js 18+ from https://nodejs.org/
-- [ ] Python 3.11+ from https://www.python.org/downloads/
-- [ ] MongoDB 7.0+ from https://www.mongodb.com/try/download/community
-- [ ] Yarn: Run `npm install -g yarn` after Node.js is installed
-- [ ] VS Code (optional) from https://code.visualstudio.com/
-
----
-
-## 🚀 Quick Start (6 Steps)
-
-
-### Step 2️⃣: Open Three Terminals (30 seconds)
-
-Open VS Code → Open the extracted folder → Open 3 terminals:
-- Terminal → New Terminal (repeat 3 times)
-- Or use keyboard shortcut: `Ctrl + Shift + `` (backtick)
-
-Label them mentally as:
-- Terminal 1: MongoDB
-- Terminal 2: Backend  
-- Terminal 3: Frontend
-
----
-
-### Step 3️⃣: Start MongoDB (1 minute)
-
-**Terminal 1 - Run ONE of these:**
-
-```bash
-# Windows (as Administrator)
-net start MongoDB
-
-# Mac
-brew services start mongodb-community@7.0
-
-# Linux
-sudo systemctl start mongod
-
-# Or manual start (all platforms):
-# Windows: mongod --dbpath C:\data\db
-# Mac/Linux: mongod --dbpath /data/db
+```
+Query ──▶ [1] QueryAgent ──▶ [2] RetrievalAgent ──▶ [3] GenerationAgent ──▶ Grounded Answer
+          decompose &        bi-encoder top-20        FLAN-T5 generation,
+          expand query        -> cross-encoder         graph/ontology risk
+                               rerank to top-5          scoring, citations,
+                                                         confidence signal
 ```
 
-✅ Look for: "Waiting for connections on port 27017"
+- **QueryAgent** (`backend/local_llm_agent.py`) — extracts a drug pair from the query and expands
+  it with known synonyms/drug-class terms (`backend/drug_knowledge.py`).
+- **RetrievalAgent** — hybrid retrieval: a bi-encoder (`all-MiniLM-L6-v2`) fetches the top 20
+  candidates from a **swappable vector backend**, then a cross-encoder
+  (`cross-encoder/ms-marco-MiniLM-L-6-v2`) re-ranks them to the final top 5
+  (`backend/reranker.py`).
+- **GenerationAgent** — generates a grounded explanation with a local FLAN-T5-large model, assesses
+  interaction severity (drug-interaction graph lookup, falling back to an embedding-similarity
+  ontology match when no graph edge exists), builds citations, and computes a grounding score plus
+  a lexical-overlap confidence/hallucination signal.
 
----
+The whole pipeline is wired through LangGraph (`backend/langgraph_agent.py`) as an explicit
+5-node graph with one conditional edge (graph-based risk lookup, falling back to the ontology
+match only when the graph has no edge for that pair).
 
-### Step 4️⃣: Start Backend (5-10 minutes first time)
+### Retrieval backend: FAISS + Azure AI Search
 
-**Terminal 2:**
+Retrieval runs against either a local FAISS index (`backend/data_processor_drugbank.py`, exact
+nearest-neighbor search) or Azure AI Search (`backend/azure_search_processor.py`, HNSW
+approximate vector search), selected at runtime via `RETRIEVAL_BACKEND=faiss|azure`. Both expose
+the identical `search(query, top_k) -> [{id, text, source}]` interface, so nothing downstream
+changes when you swap backends. Same embedding model, same document set, on both sides —
+the comparison below isolates the vector-store backend as the only variable.
 
-```bash
-# Navigate to backend
-cd backend
+## Real, benchmarked results
 
-# Create virtual environment
-python -m venv venv
+### Retrieval quality: FAISS vs. Azure AI Search
 
-# Activate it
-# Windows:
-venv\Scripts\activate
+Ran via `backend/run_retrieval_evaluation.py` (unmodified) against both backends, same 8
+ground-truth queries, same 11,798-chunk corpus:
 
-# Mac/Linux:
-source venv/bin/activate
+| Metric | FAISS (exact) | Azure AI Search (HNSW) |
+|---|---|---|
+| Precision@5 | 52.5% | 52.5% |
+| Recall@5 | 74.0% | 74.0% |
+| NDCG@5 | 73.6% | 73.6% |
+| MRR | 70.8% | 70.8% |
 
-# Install dependencies (FIRST TIME ONLY - takes 5-10 min)
-pip install -r requirements.txt
+Identical — verified document-for-document, not just at the aggregate-score level. At this
+corpus size (~11.8K chunks), Azure's approximate HNSW index found the same top-5 neighbors as
+FAISS's exact search on every query in the evaluation set.
 
-# Start server
-uvicorn server:app --host 0.0.0.0 --port 8001 --reload
+### End-to-end pipeline (retrieval + reranking + generation)
+
+Ran the full 3-agent LangGraph pipeline against the same 8 ground-truth queries, CPU-only local
+inference:
+
+| Metric | Value |
+|---|---|
+| Average grounding score | 81.5% |
+| Average confidence score | 0.55 (MEDIUM band) |
+| Average end-to-end latency | 7.8s (max 9.8s) |
+
+The confidence/hallucination signal is a lightweight, real heuristic — lexical content-word
+overlap between the generation and its retrieved context, blended with the reranker's retrieval
+confidence — not a rigorous NLI-based hallucination detector. It's noisiest on very short
+generations (few content words to check overlap against), which is a known limitation of the
+metric, not hidden here.
+
+## Dataset
+
+Parsed from the DrugBank Open Access dataset (not redistributed in this repo — DrugBank requires
+a license to redistribute their raw XML):
+
+- 500 primary drug entries fully parsed
+- 2,188 unique drug names referenced across interaction records
+- 11,798 total chunks (general info, clinical info, and pairwise interaction chunks)
+- 11,192 pairwise interaction records, with severity classified via embedding-similarity match
+  against an S0–S3 clinical-severity rubric (177 major, 1 moderate, 677 minor, 10,337 below
+  confidence threshold / unclassified)
+
+`backend/data/chunks_drugbank.json` (FAISS-ready chunks) and
+`backend/data/drugbank_interactions.json` (drug-pair graph data, derived from the chunks) are
+both checked in so the pipeline runs without needing a DrugBank license.
+
+## Known limitations
+
+- The parsed dataset is capped at 500 primary drugs (a demo-scale limit in the chunking script),
+  not full DrugBank coverage — some common drug names (e.g., plain "Aspirin") aren't present as
+  standalone entities, only as interaction targets of the 500 parsed drugs.
+- End-to-end latency (~7.8s avg) reflects CPU-only local FLAN-T5-large inference; no GPU
+  acceleration is configured.
+- The confidence/hallucination signal is a lexical-overlap heuristic, not a trained or NLI-based
+  classifier.
+
+## Tech stack
+
+- **Retrieval**: FAISS (`IndexFlatL2`) / Azure AI Search (HNSW vector search), `sentence-transformers`
+- **Reranking**: cross-encoder (`ms-marco-MiniLM-L-6-v2`)
+- **Generation**: FLAN-T5-large (local, no external LLM API required)
+- **Orchestration**: LangGraph
+- **Backend**: FastAPI, MongoDB (query history)
+- **Frontend**: React
+- **Deployment**: Docker (health-checked), `docker-compose`, EC2 setup script (`deploy/`)
+- **Monitoring**: rolling p50/p95/p99 latency tracker (`backend/monitoring.py`), exposed at
+  `GET /api/metrics`
+
+## Project structure
+
+```
+backend/
+  local_llm_agent.py          # QueryAgent, RetrievalAgent, GenerationAgent
+  langgraph_agent.py          # LangGraph orchestration of the 3 agents
+  data_processor_drugbank.py  # FAISS backend (default)
+  azure_search_processor.py   # Azure AI Search backend
+  reranker.py                 # Cross-encoder reranking + hybrid retrieval
+  drug_graph.py                # Drug interaction knowledge graph
+  monitoring.py                # Latency tracking middleware
+  server.py                    # FastAPI app
+  scripts/
+    build_interaction_graph_data.py   # Derives drugbank_interactions.json
+    upload_to_azure_search.py         # Populates the Azure AI Search index
+  run_retrieval_evaluation.py  # Retrieval-only eval harness (precision/recall/NDCG/MRR)
+frontend/                      # React UI
+deploy/                        # EC2 deployment script
 ```
 
-✅ Wait for: "Application startup complete"
+## Running it locally
 
-**First run takes 2-3 minutes extra** for dataset download!
-
----
-
-### Step 5️⃣: Start Frontend (3-5 minutes first time)
-
-**Terminal 3:**
-
-```bash
-# Navigate to frontend
-cd frontend
-
-# Install dependencies (FIRST TIME ONLY - takes 3-5 min)
-yarn install
-
-# Start React app
-yarn start
-```
-
-✅ Browser should auto-open to http://localhost:3000
-
----
-
-### Step 6️⃣: Test It! (30 seconds)
-
-1. Browser opens to http://localhost:3000
-2. You see "MediSafe AI" interface
-3. Type in the query box: "What are the interactions between aspirin and warfarin?"
-4. Click "Analyze Query"
-5. Wait 15-30 seconds
-6. See results with risk score and citations!
-
-🎉 **You're done!**
-
----
-
-## ⚡ Super Quick Reference
-
-### Starting Everything (After First Setup)
-
-You only need to run these 3 commands in 3 different terminals:
+Prerequisites: Node.js 18+, Python 3.11+, MongoDB 7.0+, Yarn.
 
 ```bash
 # Terminal 1: MongoDB
-mongod --dbpath /data/db  # or net start MongoDB on Windows
+mongod --dbpath /data/db   # or: brew services start mongodb-community@7.0
 
 # Terminal 2: Backend
 cd backend
-source venv/bin/activate  # or venv\Scripts\activate on Windows
+python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 uvicorn server:app --host 0.0.0.0 --port 8001 --reload
 
-# Terminal 3: Frontend  
+# Terminal 3: Frontend
 cd frontend
+yarn install
 yarn start
 ```
 
-Then open: http://localhost:3000
+Open http://localhost:3000 and try: *"What are the interactions between aspirin and warfarin?"*
 
----
+To use the Azure AI Search backend instead of FAISS, set `AZURE_SEARCH_ENDPOINT`,
+`AZURE_SEARCH_API_KEY`, and `AZURE_SEARCH_INDEX_NAME` in `backend/.env`, run
+`python scripts/upload_to_azure_search.py` once to populate the index, then set
+`RETRIEVAL_BACKEND=azure`.
 
-## 🛑 Stopping Everything
-
-Press `Ctrl + C` in each terminal (1, 2, 3)
-
-To stop MongoDB service:
-- Windows: `net stop MongoDB`
-- Mac: `brew services stop mongodb-community@7.0`
-- Linux: `sudo systemctl stop mongod`
-
----
-
-## 🔥 Most Common Issues & Quick Fixes
-
-### ❌ "Module not found" (Backend)
-```bash
-cd backend
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### ❌ "Port 3000 already in use" (Frontend)
-```bash
-# Kill the port
-npx kill-port 3000
-# Or on Windows: netstat -ano | findstr :3000, then taskkill /PID <PID> /F
-```
-
-### ❌ "Cannot connect to MongoDB"
-```bash
-# Make sure it's running
-mongosh  # Should connect
-# If not, start MongoDB (see Step 3)
-```
-
-### ❌ Blank page in browser
-```bash
-# Check backend is running
-curl http://localhost:8001/api/
-# Should show: {"message":"Drug Interaction RAG System API","status":"active"}
-
-# If not showing, restart backend
-```
-
-### ❌ "Permission denied" (Mac/Linux)
-```bash
-sudo chown -R $USER:$USER /data/db
-sudo chown -R $USER:$USER ~/Projects/MediSafe
-```
-
----
-
-## 📊 How to Know Everything is Working
-
-### ✅ Checklist:
-
-**MongoDB:**
-- Terminal 1 shows: "Waiting for connections"
-- Or run: `mongosh` → connects successfully
-
-**Backend:**
-- Terminal 2 shows: "Uvicorn running on http://0.0.0.0:8001"
-- Open: http://localhost:8001/api/ → see JSON response
-
-**Frontend:**
-- Terminal 3 shows: "webpack compiled successfully"
-- Open: http://localhost:3000 → see MediSafe AI interface
-- No errors in browser console (press F12)
-
----
-
-## 🎨 Features to Try
-
-### 1. Dark Mode
-- Click sun/moon toggle in header
-- Theme switches instantly
-
-### 2. Export Report
-- Submit a query
-- Go to "Result" tab
-- Click "Export Report" button
-- Text file downloads
-
-### 3. Compare Queries
-- Submit 2-3 different queries
-- Go to "History" tab
-- Click "+" on each query
-- Go to "Compare" tab
-- See side-by-side comparison
-
-### 4. View Stats
-- Check "Total Queries Processed"
-- See "Risk Distribution" breakdown
-
----
-
-## 📝 Example Queries to Try
-
-```
-1. What are the interactions between aspirin and warfarin?
-
-2. Can I take antibiotics with antacids?
-
-3. Is it safe to mix blood pressure medication with NSAIDs?
-
-4. What are the side effects of combining statins with grapefruit juice?
-
-5. Can ibuprofen and acetaminophen be taken together?
-```
-
----
-
-## ⏱️ Time Expectations
-
-**First Time Setup:**
-- Installing prerequisites: 15-20 minutes
-- Project setup: 10-15 minutes
-- **Total: ~30-35 minutes**
-
-**Starting After Setup:**
-- Starting all services: 1-2 minutes
-- First query: 15-30 seconds
-- Subsequent queries: 10-20 seconds
-
-**Subsequent Runs:**
-- Just start the 3 terminals: 2 minutes
-- No reinstalling needed!
-
----
-
-## 💾 Project Disk Space
-
-- Backend (with dependencies): ~2 GB
-- Frontend (with node_modules): ~500 MB
-- MongoDB data: ~100 MB (grows with queries)
-- **Total: ~2.5-3 GB**
-
----
-
-## 🔧 When to Reinstall Dependencies
-
-You only need to reinstall if:
-
-❌ You deleted node_modules or venv folders  
-❌ You updated package.json or requirements.txt  
-❌ You get "module not found" errors  
-
-Otherwise, just start the servers! ✅
-
----
-
-## 🎯 Success Metrics
-
-You know it's working when:
-
-✅ MongoDB: No errors, shows "waiting for connections"  
-✅ Backend: Shows startup complete, responds to http://localhost:8001/api/  
-✅ Frontend: Opens in browser, shows UI, no console errors  
-✅ Query: Enter query → Get result with risk score in 15-30 seconds  
-
----
-
-## 📞 Need More Detail?
-
-This is the **ultra-simplified guide**. For detailed troubleshooting:
-
-👉 See **DETAILED_LOCAL_SETUP.md** (comprehensive 500+ line guide)  
-👉 See **LOCAL_SETUP_INSTRUCTIONS.md** (detailed technical guide)  
-👉 See **README.md** (project overview and features)
-
----
-
-## 🎉 That's It!
-
-If all three terminals are running and you can see the app at http://localhost:3000:
-
-**🏆 Congratulations! You did it! 🏆**
-
-Now try some queries and explore the features!
-
----
-
-## 🚨 Emergency Quick Fix
-
-If nothing works and you want to start fresh:
+### Docker
 
 ```bash
-# 1. Stop everything (Ctrl+C in all terminals)
-
-# 2. Delete generated files
-cd backend
-rm -rf venv __pycache__ data
-
-cd ../frontend
-rm -rf node_modules .cache
-
-# 3. Follow steps 4 and 5 again (reinstall everything)
+docker compose up -d --build
+curl http://localhost:8001/api/health
 ```
 
----
+Or on a fresh EC2 instance: `bash deploy/ec2_setup.sh`.
 
-**Happy Querying! 🏥✨**
+## License
 
-Remember: This is for educational purposes. Always consult healthcare professionals for medical advice!
+MIT — see `LICENSE`.
+
+This project is for educational/research purposes. It is not a substitute for professional
+medical advice.

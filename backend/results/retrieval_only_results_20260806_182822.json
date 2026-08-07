@@ -1,0 +1,115 @@
+{
+  "retrieval": {
+    "precision@5": 0.525,
+    "recall@5": 0.7395833333333333,
+    "ndcg@5": 0.7363796959381432,
+    "mrr": 0.7083333333333333
+  },
+  "timestamp": "20260806_182822",
+  "num_examples": 8,
+  "details": [
+    {
+      "query": "What are the interactions between aspirin and warfarin?",
+      "expected_drugs": [
+        "aspirin",
+        "warfarin",
+        "acetylsalicylic acid"
+      ],
+      "relevant_retrieved": 5,
+      "precision": 1.0,
+      "recall": 1.0,
+      "ndcg": 1.0,
+      "mrr": 1.0
+    },
+    {
+      "query": "Can I take ibuprofen with blood pressure medication?",
+      "expected_drugs": [
+        "ibuprofen",
+        "antihypertensive",
+        "nsaid"
+      ],
+      "relevant_retrieved": 3,
+      "precision": 0.6,
+      "recall": 1.0,
+      "ndcg": 0.9674679834891693,
+      "mrr": 1.0
+    },
+    {
+      "query": "Is it safe to combine metformin with insulin?",
+      "expected_drugs": [
+        "metformin",
+        "insulin"
+      ],
+      "relevant_retrieved": 5,
+      "precision": 1.0,
+      "recall": 1.0,
+      "ndcg": 1.0,
+      "mrr": 1.0
+    },
+    {
+      "query": "What happens if I mix alcohol with antibiotics?",
+      "expected_drugs": [
+        "alcohol",
+        "antibiotic"
+      ],
+      "relevant_retrieved": 2,
+      "precision": 0.4,
+      "recall": 1.0,
+      "ndcg": 0.5706417189553201,
+      "mrr": 0.3333333333333333
+    },
+    {
+      "query": "Can I take vitamin C with aspirin?",
+      "expected_drugs": [
+        "vitamin c",
+        "ascorbic acid",
+        "aspirin"
+      ],
+      "relevant_retrieved": 2,
+      "precision": 0.4,
+      "recall": 0.6666666666666666,
+      "ndcg": 1.0,
+      "mrr": 1.0
+    },
+    {
+      "query": "Interaction between SSRIs and NSAIDs?",
+      "expected_drugs": [
+        "ssri",
+        "nsaid",
+        "selective serotonin reuptake inhibitor"
+      ],
+      "relevant_retrieved": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "ndcg": 0,
+      "mrr": 0
+    },
+    {
+      "query": "Is grapefruit juice safe with statins?",
+      "expected_drugs": [
+        "grapefruit",
+        "statin",
+        "atorvastatin",
+        "simvastatin"
+      ],
+      "relevant_retrieved": 1,
+      "precision": 0.2,
+      "recall": 0.25,
+      "ndcg": 0.5,
+      "mrr": 0.3333333333333333
+    },
+    {
+      "query": "Can I take acetaminophen with ibuprofen?",
+      "expected_drugs": [
+        "acetaminophen",
+        "paracetamol",
+        "ibuprofen"
+      ],
+      "relevant_retrieved": 3,
+      "precision": 0.6,
+      "recall": 1.0,
+      "ndcg": 0.8529278650606567,
+      "mrr": 1.0
+    }
+  ]
+}

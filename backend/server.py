@@ -11,10 +11,13 @@ from typing import List, Dict, Optional
 import uuid
 from datetime import datetime, timezone
 
+from monitoring import tracker, LatencyMiddleware
+
 # --- Changed Imports ---
 # from agents import GroundedRAGSystem  <-- Removed to avoid Gemini dependency
 from retrieval_only_agent import create_retrieval_only_agent
 from local_llm_agent import create_local_llm_agent
+from langgraph_agent import LangGraphDrugAgent
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -35,16 +38,18 @@ retrieval_only_system = create_retrieval_only_agent()
 
 # 2. Initialize LOCAL LLM (Primary System)
 # We no longer require GEMINI_API_KEY for startup
-logger.info("Initializing LOCAL LLM System (FLAN-T5)...")
+logger.info("Initializing LangGraph Drug RAG pipeline...")
 try:
-    local_llm_system = create_local_llm_agent()
-    logger.info("✅ Initialized: Local FLAN-T5 Agent")
+    _base_agent = create_local_llm_agent()
+    local_llm_system = LangGraphDrugAgent(_base_agent)
+    logger.info("✅ Initialized: LangGraph Drug RAG (5 nodes, 1 conditional edge)")
 except Exception as e:
-    logger.error(f"Failed to initialize Local LLM: {e}")
+    logger.error(f"Failed to initialize LangGraph agent: {e}")
     raise e
 
 # Create the main app
 app = FastAPI(title="Local Drug Interaction RAG System")
+app.add_middleware(LatencyMiddleware)
 api_router = APIRouter(prefix="/api")
 
 # Models
@@ -87,6 +92,16 @@ class HistoryItem(BaseModel):
 async def root():
     return {"message": "Local Drug Interaction RAG System API", "status": "active", "model": "FLAN-T5-Large"}
 
+@api_router.get("/health")
+async def health():
+    """Liveness + latency snapshot — used by Docker HEALTHCHECK and load balancers."""
+    return {"status": "healthy", "model": "FLAN-T5-Large", "vector_db": "FAISS", **tracker.stats()}
+
+@api_router.get("/metrics")
+async def metrics():
+    """Rolling p50/p95/p99 query latency, request volume, and avg grounding score."""
+    return tracker.stats()
+
 @api_router.post("/query", response_model=QueryResponse)
 async def process_query(request: QueryRequest):
     """Process a drug interaction query using Local LLM"""
@@ -126,12 +141,15 @@ async def process_query(request: QueryRequest):
             user_id=request.user_id
         )
         
+        # Record grounding score for /metrics
+        tracker.record_grounding(response.grounding_score)
+
         # Store in database
         doc = response.model_dump()
         doc['timestamp'] = doc['timestamp'].isoformat()
         doc['citations'] = [c.model_dump() for c in response.citations]
         await db.queries.insert_one(doc)
-        
+
         return response
         
     except Exception as e:

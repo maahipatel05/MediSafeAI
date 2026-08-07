@@ -163,8 +163,20 @@ class DrugBankProcessor:
 # Singleton
 processor = None
 def get_processor():
+    """Return the retrieval processor selected by RETRIEVAL_BACKEND.
+
+    Unset (or 'faiss') keeps today's behavior byte-identical: a
+    DrugBankProcessor backed by the local FAISS index. 'azure' swaps in
+    AzureSearchProcessor instead -- same search(query, top_k) -> List[Dict]
+    interface, so callers don't need to change.
+    """
     global processor
     if processor is None:
-        processor = DrugBankProcessor()
-        processor.load_index()
+        backend = os.environ.get("RETRIEVAL_BACKEND", "faiss").lower()
+        if backend == "azure":
+            from azure_search_processor import AzureSearchProcessor
+            processor = AzureSearchProcessor()
+        else:
+            processor = DrugBankProcessor()
+            processor.load_index()
     return processor

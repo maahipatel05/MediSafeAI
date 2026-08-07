@@ -60,6 +60,22 @@ Identical — verified document-for-document, not just at the aggregate-score le
 corpus size (~11.8K chunks), Azure's approximate HNSW index found the same top-5 neighbors as
 FAISS's exact search on every query in the evaluation set.
 
+### Reranking impact
+
+The retrieval comparison above uses raw bi-encoder search with no reranking (that's what
+`run_retrieval_evaluation.py` measures). Separately isolating the cross-encoder reranking step
+(bi-encoder top-20 → cross-encoder top-5) against the same 8 queries:
+
+| Metric | Bi-encoder only (top-5) | + Cross-encoder rerank (20→5) |
+|---|---|---|
+| Precision@5 | 52.5% | 77.5% |
+| Recall@5 | 74.0% | 87.5% |
+| NDCG@5 | 73.6% | 84.5% |
+| MRR | 70.8% | 81.25% |
+
+Verified identical on both backends — reranking against Azure AI Search produces the same
+77.5% / 87.5% / 84.5% / 81.25% as FAISS, not just an assumption from the raw-retrieval parity above.
+
 ### End-to-end pipeline (retrieval + reranking + generation)
 
 Ran the full 3-agent LangGraph pipeline against the same 8 ground-truth queries, CPU-only local

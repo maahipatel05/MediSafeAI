@@ -1,6 +1,6 @@
 import React from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
-import { Brain, Database, Zap, Shield, Network, Cpu, GitBranch, Layers, Box } from 'lucide-react';
+import { Brain, Database, Shield, Network, Cpu, GitBranch, Layers, Box } from 'lucide-react';
 
 const SystemArchitecture = () => {
   const architectureSections = [
@@ -9,135 +9,88 @@ const SystemArchitecture = () => {
       icon: <Layers className="h-6 w-6" />,
       color: "from-blue-500 to-cyan-500",
       content: {
-        description: "MediSafe AI is a production-grade Grounded Agentic RAG (Retrieval-Augmented Generation) system designed for drug interaction analysis and safety assessment.",
+        description: "MediSafe AI is a grounded, retrieval-augmented drug-interaction assistant. Every answer is backed by citations into a DrugBank-derived knowledge base.",
         keyPoints: [
-          "Multi-agent architecture with specialized components",
-          "DrugBank database with 12,000+ pharmaceutical entries",
-          "Real-time AI-powered analysis using Local FLAN-T5",
-          "FAISS vector search for semantic retrieval"
+          "Three-agent pipeline orchestrated via LangGraph",
+          "500 primary DrugBank entries parsed, 2,188+ unique drug names referenced across interactions",
+          "Swappable retrieval backend: FAISS (exact) or Azure AI Search (HNSW approximate)",
+          "Local FLAN-T5 generation -- no external LLM API required"
         ]
       }
     },
     {
-      title: "1. Query Decomposition Agent",
+      title: "1. Query Agent",
       icon: <GitBranch className="h-6 w-6" />,
       color: "from-purple-500 to-indigo-500",
       content: {
-        description: "Breaks down complex medical queries into simpler, focused sub-queries for more accurate retrieval.",
+        description: "Extracts a drug pair from the query and expands it with known synonyms and drug-class terms before retrieval.",
         workflow: [
-          "User submits complex query (e.g., 'Can I take aspirin with warfarin while on blood pressure medication?')",
-          "Agent analyzes query structure and medical context",
-          "Decomposes into 2-4 focused sub-queries",
-          "Each sub-query targets specific aspects (drug A effects, drug B effects, interaction mechanisms)"
+          "User submits a query (e.g., 'Can I take ibuprofen with blood pressure medication?')",
+          "Attempts to match two known drug names directly in the query text",
+          "Expands generic terms (drug classes, brand names) into the specific ingredient names the corpus indexes on"
         ],
         technical: {
-          model: "Local FLAN-T5",
-          method: "Prompt engineering with structured JSON output",
-          averageTime: "~2-3 seconds"
+          module: "backend/local_llm_agent.py (QueryAgent)",
+          drugMatching: "backend/drug_name_extractor.py",
+          expansion: "backend/drug_knowledge.py (medication classes + synonyms)"
         }
       }
     },
     {
-      title: "2. Retrieval Agent (Semantic Search)",
+      title: "2. Retrieval Agent",
       icon: <Database className="h-6 w-6" />,
       color: "from-cyan-500 to-blue-500",
       content: {
-        description: "Uses FAISS vector search with sentence transformers to find relevant drug information from the DrugBank database.",
+        description: "Hybrid retrieval: a bi-encoder fetches broad candidates, then a cross-encoder re-ranks them for precision.",
         workflow: [
-          "Receives sub-queries from decomposition agent",
-          "Converts queries to 384-dimensional embeddings using sentence-transformers",
-          "Searches FAISS index containing 12,000+ drug embeddings",
-          "Returns top-K most semantically similar documents",
-          "Deduplicates and ranks results across all sub-queries"
+          "Bi-encoder (all-MiniLM-L6-v2) embeds the query and searches the vector index for the top 20 candidates",
+          "Cross-encoder (ms-marco-MiniLM-L-6-v2) scores each (query, document) pair directly",
+          "Re-ranks and returns the top 5 documents"
         ],
         technical: {
-          embeddingModel: "all-MiniLM-L6-v2 (sentence-transformers)",
-          indexType: "FAISS IndexFlatIP (Inner Product)",
-          retrievalK: "3-5 documents per sub-query",
-          searchTime: "<100ms"
+          embeddingModel: "all-MiniLM-L6-v2 (384-dim)",
+          backend: "FAISS IndexFlatL2 (default) or Azure AI Search HNSW, via RETRIEVAL_BACKEND",
+          rerankerModel: "cross-encoder/ms-marco-MiniLM-L-6-v2",
+          measuredImpact: "precision@5 52.5% -> 77.5% from reranking (measured, 8-query eval set)"
         }
       }
     },
     {
-      title: "3. Cross-Encoder Re-Ranking",
-      icon: <Shield className="h-6 w-6" />,
-      color: "from-indigo-500 to-purple-500",
-      content: {
-        description: "Improves retrieval accuracy by re-scoring initial results with a more powerful cross-encoder model.",
-        workflow: [
-          "Takes initial retrieval results from bi-encoder",
-          "Creates (query, document) pairs",
-          "Scores each pair with cross-encoder",
-          "Re-ranks documents by new scores",
-          "Returns refined top-K results"
-        ],
-        technical: {
-          model: "ms-marco-MiniLM-L-6-v2",
-          architecture: "Cross-encoder (joint query-document encoding)",
-          improvement: "~15-20% precision gain over bi-encoder alone"
-        }
-      }
-    },
-    {
-      title: "4. Generation Agent (Response Synthesis)",
+      title: "3. Generation Agent",
       icon: <Brain className="h-6 w-6" />,
       color: "from-blue-500 to-purple-500",
       content: {
-        description: "Generates grounded, evidence-based responses with proper citations and risk assessment.",
+        description: "Generates a grounded explanation, assesses interaction risk, and gates the answer on a real confidence check.",
         workflow: [
-          "Receives top-ranked documents from retrieval",
-          "Constructs context from drug information and interactions",
-          "Generates comprehensive response with Local FLAN-T5",
-          "Enforces strict grounding to provided sources",
-          "Extracts risk score (LOW/MODERATE/HIGH/CRITICAL)",
-          "Creates citations linking claims to sources"
+          "FLAN-T5-large generates an answer from the top-5 retrieved documents",
+          "The generated sentence is checked for semantic similarity against the retrieved evidence",
+          "If it doesn't clear the grounding threshold, it's replaced with a verbatim quote from the source document instead (confidence-gated extractive fallback)",
+          "Interaction severity is looked up in the drug interaction graph, falling back to an embedding-similarity ontology match if no graph edge exists",
+          "Builds citations and a grounding score from the reranker's own relevance scores"
         ],
         technical: {
-          model: "Local FLAN-T5",
-          temperature: "0.7 for balanced creativity/accuracy",
-          maxTokens: "2048",
-          groundingMethod: "Prompt engineering with source attribution"
+          model: "Local FLAN-T5-large (CPU)",
+          confidenceCheck: "Cosine similarity vs. retrieved evidence, same MiniLM encoder used for retrieval",
+          measuredResult: "0% hallucination rate on the 8-query eval set (fallback triggered 8/8)"
         }
       }
     },
     {
-      title: "5. Drug Interaction Graph",
+      title: "Drug Interaction Graph",
       icon: <Network className="h-6 w-6" />,
       color: "from-green-500 to-emerald-500",
       content: {
-        description: "Novel graph-based architecture representing drugs as nodes and interactions as weighted edges.",
+        description: "In-memory graph of drug-drug interactions, derived from the parsed DrugBank chunks, used for the preferred (fast) risk-severity lookup path.",
         features: [
-          "Drugs represented as nodes in NetworkX graph",
-          "Interactions as edges with severity weights (1-4)",
-          "Graph-enhanced retrieval using neighbor expansion",
-          "Centrality analysis to identify high-risk drugs",
-          "Community detection for drug cluster identification"
+          "Nodes are drug names; edges are interaction pairs with a classified severity",
+          "Severity (S0-S3) classified via embedding similarity against a clinical-severity rubric, since DrugBank's raw interaction records carry no severity field",
+          "Falls back to an ontology similarity match at query time when a pair has no graph edge"
         ],
         technical: {
-          library: "NetworkX 3.5",
-          nodeCount: "~8,000 unique drugs",
-          edgeCount: "~15,000 documented interactions",
-          algorithms: ["Betweenness centrality", "Community detection", "Shortest path"]
-        }
-      }
-    },
-    {
-      title: "6. Uncertainty Quantification",
-      icon: <Zap className="h-6 w-6" />,
-      color: "from-yellow-500 to-orange-500",
-      content: {
-        description: "Provides confidence scores and detects potential hallucinations in generated responses.",
-        components: [
-          "Monte Carlo Dropout: Generates multiple predictions to estimate uncertainty",
-          "Retrieval Confidence: Analyzes score variance and coverage",
-          "Grounding Verification: Checks if claims are supported by sources",
-          "Hallucination Detection: Identifies unsupported statements",
-          "Overall Confidence Scoring: Weighted combination of all signals"
-        ],
-        technical: {
-          samplingMethod: "Multiple generation passes (3-5 samples)",
-          claimExtraction: "Sentence-based factual statement parsing",
-          verificationThreshold: "50% word overlap with sources"
+          library: "Custom adjacency-map graph (backend/drug_graph.py)",
+          interactionRecords: "11,192 pairwise records",
+          uniqueDrugNames: "2,188 referenced across those records",
+          severityBreakdown: "177 major, 1 moderate, 677 minor, 10,337 below confidence threshold"
         }
       }
     },
@@ -146,17 +99,16 @@ const SystemArchitecture = () => {
       icon: <Box className="h-6 w-6" />,
       color: "from-pink-500 to-rose-500",
       content: {
-        description: "Complete end-to-end processing pipeline from user query to final response.",
+        description: "End-to-end pipeline from user query to final response, orchestrated as an explicit LangGraph state machine.",
         steps: [
-          "1. User Query → Query Decomposition Agent (2-3s)",
-          "2. Sub-queries → Retrieval Agent (FAISS search <100ms)",
-          "3. Initial Results → Cross-Encoder Re-Ranking (~500ms)",
-          "4. Ranked Documents + Query → Generation Agent (8-12s)",
-          "5. Response → Grounding Verification (1-2s)",
-          "6. Final Response + Metadata → User Interface"
+          "1. User Query -> Query Agent (drug-pair extraction + expansion)",
+          "2. Expanded Query -> Retrieval Agent (bi-encoder top-20 -> cross-encoder top-5)",
+          "3. Top-5 Documents -> Generation Agent (FLAN-T5 + confidence gate)",
+          "4. Risk Assessment -> Graph lookup, or ontology fallback if no edge",
+          "5. Final Response + Citations + Grounding Score -> MongoDB -> User Interface"
         ],
-        totalTime: "~12-18 seconds per query",
-        caching: "MongoDB stores all query history for reuse"
+        totalTime: "~5.8s average end-to-end latency (measured, CPU-only local inference, 8-query eval set)",
+        caching: "MongoDB stores query history for the History and Compare tabs"
       }
     },
     {
@@ -173,20 +125,20 @@ const SystemArchitecture = () => {
         ],
         backend: [
           "FastAPI (Python async web framework)",
-          "Motor (Async MongoDB driver)",
-          "Uvicorn (ASGI server)",
+          "LangGraph (agent orchestration)",
+          "Motor (async MongoDB driver)",
           "Sentence Transformers",
-          "FAISS (Facebook AI Similarity Search)"
+          "FAISS / Azure AI Search (swappable retrieval backend)"
         ],
         aiModels: [
-          "Local FLAN-T5 (Google)",
-          "all-MiniLM-L6-v2 (Bi-encoder)",
-          "ms-marco-MiniLM-L-6-v2 (Cross-encoder)"
+          "Local FLAN-T5-large (Google)",
+          "all-MiniLM-L6-v2 (bi-encoder)",
+          "ms-marco-MiniLM-L-6-v2 (cross-encoder)"
         ],
         database: [
           "MongoDB (query history)",
-          "DrugBank XML (drug data)",
-          "FAISS index (vector embeddings)"
+          "DrugBank-derived chunk data (checked into the repo)",
+          "FAISS index / Azure AI Search index"
         ]
       }
     }
@@ -203,7 +155,7 @@ const SystemArchitecture = () => {
           </h2>
         </div>
         <p className="text-lg text-gray-400 max-w-4xl mx-auto">
-          Comprehensive technical documentation of the MediSafe AI system architecture, components, and data flow
+          Technical documentation of the MediSafe AI system architecture, components, and data flow
         </p>
       </div>
 
@@ -265,21 +217,6 @@ const SystemArchitecture = () => {
                     <li key={i} className="text-gray-300 flex items-start gap-2">
                       <span className="text-green-500 mt-1">✓</span>
                       <span>{feature}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {/* Components */}
-            {section.content.components && (
-              <div className="space-y-2">
-                <h4 className="font-semibold text-yellow-400">Components:</h4>
-                <ul className="space-y-1 ml-4">
-                  {section.content.components.map((comp, i) => (
-                    <li key={i} className="text-gray-300 flex items-start gap-2">
-                      <span className="text-yellow-500 mt-1">◆</span>
-                      <span>{comp}</span>
                     </li>
                   ))}
                 </ul>
@@ -368,7 +305,7 @@ const SystemArchitecture = () => {
             {section.content.totalTime && (
               <div className="bg-blue-500/10 border border-blue-500/30 p-3 rounded-lg">
                 <div className="flex items-center gap-2 text-blue-300">
-                  <Zap className="h-5 w-5" />
+                  <Shield className="h-5 w-5" />
                   <span className="font-semibold">Performance:</span>
                   <span>{section.content.totalTime}</span>
                 </div>
@@ -392,22 +329,19 @@ const SystemArchitecture = () => {
           <div className="bg-gray-800/50 p-6 rounded-lg font-mono text-sm text-gray-300 space-y-2">
             <div>┌─ User Query</div>
             <div>│</div>
-            <div>├─▶ [1] Query Decomposition Agent (Local FLAN-T5)</div>
-            <div>│   └─▶ Sub-queries: [Q1, Q2, Q3]</div>
+            <div>├─▶ [1] Query Agent (drug-pair extraction + expansion)</div>
             <div>│</div>
-            <div>├─▶ [2] Retrieval Agent (FAISS + Sentence Transformers)</div>
-            <div>│   └─▶ Initial Results: Top-20 documents</div>
+            <div>├─▶ [2] Retrieval Agent (bi-encoder top-20 → cross-encoder top-5)</div>
+            <div>│   └─▶ FAISS or Azure AI Search, selected via RETRIEVAL_BACKEND</div>
             <div>│</div>
-            <div>├─▶ [3] Cross-Encoder Re-Ranking (ms-marco)</div>
-            <div>│   └─▶ Refined Results: Top-6 documents</div>
-            <div>│</div>
-            <div>├─▶ [4] Generation Agent (Local FLAN-T5)</div>
+            <div>├─▶ [3] Generation Agent (Local FLAN-T5 + confidence gate)</div>
             <div>│   └─▶ Grounded Response + Citations + Risk Score</div>
             <div>│</div>
-            <div>├─▶ [5] Uncertainty Quantification</div>
-            <div>│   └─▶ Confidence Score + Hallucination Check</div>
-            <div>│</div>
             <div>└─▶ Final Response → MongoDB → User Interface</div>
+          </div>
+          <div className="mt-4 text-sm text-gray-400">
+            Orchestrated as a LangGraph state machine: expand → retrieve → generate → graph-risk lookup
+            (falling back to an ontology similarity match when no graph edge exists) → compile.
           </div>
         </CardContent>
       </Card>

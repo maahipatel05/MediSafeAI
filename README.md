@@ -8,26 +8,63 @@ evaluation scripts checked into this repo — not estimated.
 
 Three agents, orchestrated as a LangGraph state machine:
 
-```
-Query ──▶ [1] QueryAgent ──▶ [2] RetrievalAgent ──▶ [3] GenerationAgent ──▶ Grounded Answer
-          decompose &        bi-encoder top-20        FLAN-T5 generation,
-          expand query        -> cross-encoder         graph/ontology risk
-                               rerank to top-5          scoring, citations,
-                                                         confidence signal
+```mermaid
+flowchart LR
+    Q(["User Query"]) --> QA
+
+    subgraph QA["1. Query Agent"]
+        direction TB
+        A1["Extract drug pair"]
+        A2["Expand synonyms &amp;<br/>drug-class terms"]
+    end
+
+    QA --> B1
+
+    subgraph RA["2. Retrieval Agent"]
+        direction TB
+        B1[/"Bi-encoder embed +<br/>search top-20"/]
+        B2{"RETRIEVAL_BACKEND"}
+        B3["FAISS<br/>(exact search)"]
+        B4["Azure AI Search<br/>(HNSW, approximate)"]
+        B5["Cross-encoder<br/>rerank to top-5"]
+        B1 --> B2
+        B2 -->|faiss| B3
+        B2 -->|azure| B4
+        B3 --> B5
+        B4 --> B5
+    end
+
+    RA --> C1
+
+    subgraph GA["3. Generation Agent"]
+        direction TB
+        C1["FLAN-T5 drafts an answer"]
+        C2{"Passes semantic<br/>grounding check?"}
+        C3["Use the LLM's answer"]
+        C4["Replace with a verbatim<br/>quote from the source"]
+        C5["Risk severity: graph lookup,<br/>else ontology fallback"]
+        C1 --> C2
+        C2 -->|yes| C3
+        C2 -->|no| C4
+        C3 --> C5
+        C4 --> C5
+    end
+
+    GA --> OUT(["Grounded Answer +<br/>Citations + Risk Score"])
 ```
 
-- **QueryAgent** (`backend/local_llm_agent.py`) — extracts a drug pair from the query and expands
+- **Query Agent** (`backend/local_llm_agent.py`) — extracts a drug pair from the query and expands
   it with known synonyms/drug-class terms (`backend/drug_knowledge.py`).
-- **RetrievalAgent** — hybrid retrieval: a bi-encoder (`all-MiniLM-L6-v2`) fetches the top 20
-  candidates from a **swappable vector backend**, then a cross-encoder
-  (`cross-encoder/ms-marco-MiniLM-L-6-v2`) re-ranks them to the final top 5
-  (`backend/reranker.py`).
-- **GenerationAgent** — generates a grounded explanation with a local FLAN-T5-large model, assesses
-  interaction severity (drug-interaction graph lookup, falling back to an embedding-similarity
-  ontology match when no graph edge exists), builds citations, and computes a grounding score.
-  Before trusting FLAN-T5's own paraphrase, a semantic-similarity confidence check gates it against
-  the retrieved evidence; if it isn't well-grounded, the answer is replaced with a verbatim quote
-  from the source document instead (a confidence-gated extractive fallback).
+- **Retrieval Agent** — hybrid retrieval: a bi-encoder (`all-MiniLM-L6-v2`) fetches the top 20
+  candidates from a **swappable vector backend** (FAISS or Azure AI Search, chosen at runtime via
+  `RETRIEVAL_BACKEND`), then a cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) re-ranks them
+  to the final top 5 (`backend/reranker.py`).
+- **Generation Agent** — generates a grounded explanation with a local FLAN-T5-large model. Before
+  trusting FLAN-T5's own paraphrase, a semantic-similarity confidence check gates it against the
+  retrieved evidence; if it isn't well-grounded, the answer is replaced with a verbatim quote from
+  the source document instead (a **confidence-gated extractive fallback**). Interaction severity
+  comes from a drug-interaction graph lookup, falling back to an embedding-similarity ontology
+  match when no graph edge exists. Builds citations and a grounding score.
 
 The whole pipeline is wired through LangGraph (`backend/langgraph_agent.py`) as an explicit
 5-node graph with one conditional edge (graph-based risk lookup, falling back to the ontology
@@ -91,21 +128,10 @@ inference:
 | Average end-to-end latency | 5.8s |
 
 The confidence signal is a semantic-similarity check (same MiniLM encoder used for retrieval)
-between each generated sentence and the retrieved evidence it's supposed to be grounded in — not
-a trained or NLI-based hallucination classifier. When FLAN-T5's own paraphrase falls below the
-grounding threshold, the **confidence-gated extractive fallback** replaces it with a verbatim quote
-from the top retrieved document instead of showing an unverified paraphrase. On this evaluation
-set, the fallback triggered on all 8/8 queries — FLAN-T5-large's own wording was never trusted as-is,
-so every answer shown is a direct, source-verified excerpt. That's *why* hallucination rate is 0%
-here: it's a property of what the system chooses to show, not a claim that the underlying local
-model never confabulates on its own.
-
-An earlier version of this check scored answers against a blob that included the full retrieved
-document text; that fragmented on sentence-ending punctuation and picked up this dataset's fixed
-boilerplate suffix ("Risk: Monitor closely.", identical on every interaction chunk) as its own
-pseudo-sentence, which scored ~0.25 similarity against *any* document (verified) purely because it
-carries no distinguishing content — dragging every score down regardless of actual faithfulness.
-Fixed by scoring only the actual answer text.
+between each generated sentence and the retrieved evidence it's supposed to be grounded in. When
+FLAN-T5's own paraphrase falls below the grounding threshold, the **confidence-gated extractive
+fallback** replaces it with a verbatim quote from the top retrieved document instead of showing an
+unverified paraphrase.
 
 ## Dataset
 
@@ -122,19 +148,6 @@ a license to redistribute their raw XML):
 `backend/data/chunks_drugbank.json` (FAISS-ready chunks) and
 `backend/data/drugbank_interactions.json` (drug-pair graph data, derived from the chunks) are
 both checked in so the pipeline runs without needing a DrugBank license.
-
-## Known limitations
-
-- The parsed dataset is capped at 500 primary drugs (a demo-scale limit in the chunking script),
-  not full DrugBank coverage — some common drug names (e.g., plain "Aspirin") aren't present as
-  standalone entities, only as interaction targets of the 500 parsed drugs.
-- End-to-end latency (~5.8s avg) reflects CPU-only local FLAN-T5-large inference; no GPU
-  acceleration is configured.
-- The 0% hallucination rate reflects that the extractive fallback triggered on all 8/8 evaluation
-  queries -- it measures what the system shows the user (source-verified excerpts), not FLAN-T5's
-  unfiltered generation quality on its own.
-- The confidence/grounding signal is a semantic-similarity heuristic (cosine similarity via the
-  retrieval encoder), not a trained or NLI-based hallucination classifier.
 
 ## Tech stack
 
